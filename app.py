@@ -9,7 +9,7 @@ import ast
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 VALIDATION_FILE = os.path.join(BASE, "GenCon_Validation_361.csv")
@@ -137,21 +137,43 @@ def row_to_json(row):
         out["GenCon_Genes_Detected"] = parse_gene_list(out["GenCon_Genes_Detected"])
     return out
 
+def find_amrfinder_db():
+    candidates = [
+        "/usr/local/amrfinder/data",
+        "/usr/local/share/amrfinderplus/data",
+        os.path.expanduser("~/.amrfinderplus/data")
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return None
+
 def run_fasta_analysis(fasta_path, ast_result=""):
     amrfinder = shutil.which("amrfinder") or "/usr/local/bin/amrfinder"
     if not os.path.exists(amrfinder):
-        return {"success": False, "message": "AMRFinderPlus binary not found."}
+        return {"success": False, "message": "AMRFinderPlus binary not found on path."}
 
     out_file = os.path.join(tempfile.gettempdir(), f"res_{os.getpid()}_{int(time.time())}.tsv")
     cmd = [amrfinder, "-n", fasta_path, "-O", "Acinetobacter_baumannii", "-o", out_file]
 
+    db_dir = find_amrfinder_db()
+    if db_dir:
+        cmd.extend(["-d", db_dir])
+
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if proc.returncode != 0:
-            return {"success": False, "message": proc.stderr or "AMRFinder analysis failed."}
+            err_msg = proc.stderr.strip() or proc.stdout.strip() or f"Process exited with code {proc.returncode}"
+            return {"success": False, "message": f"AMRFinderPlus error: {err_msg}"}
+
+        if not os.path.exists(out_file) or os.path.getsize(out_file) == 0:
+            return {"success": False, "message": "AMRFinderPlus completed but produced empty output."}
+
         res_df = pd.read_csv(out_file, sep="\t")
+    except subprocess.TimeoutExpired:
+        return {"success": False, "message": "Analysis timed out (exceeded 120 seconds)."}
     except Exception as e:
-        return {"success": False, "message": str(e)}
+        return {"success": False, "message": f"Execution failed: {str(e)}"}
     finally:
         if os.path.exists(out_file):
             os.remove(out_file)
@@ -166,12 +188,10 @@ def run_fasta_analysis(fasta_path, ast_result=""):
     return {
         "success": True,
         "prediction": prediction,
-        "prediction_text": "RESISTANT" if prediction == "R" else "SUSCEPTIBLE",
         "gencon_genes": gencon_detected,
-        "all_detected_elements": detected,
         "ast": ast_val or "Not provided",
         "status": status,
-        "reason": "At least one GenCon-AMR resistance determinant detected." if gencon_detected else "None of the GenCon-AMR resistance determinants detected.",
+        "reason": "At least one GenCon-AMR determinant detected." if gencon_detected else "No GenCon-AMR determinants detected.",
         "results": res_df[cols].replace({np.nan: None}).to_dict(orient="records")
     }
 
@@ -318,13 +338,17 @@ async function analyzeGenome() {
 
     try {
         const res = await fetch("/api/analyze-fasta", { method: "POST", body: fd });
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(`Server returned HTTP ${res.status}: ${errText}`);
+        }
         const d = await res.json();
         if (!d.success) {
             document.getElementById("analysisResult").innerHTML = `<div style="color:red; margin-top:10px;"><b>Error:</b> ${d.message}</div>`;
             return;
         }
         const cls = d.prediction === "R" ? "r" : "s";
-        const genes = d.gencon_genes.map(g => `<span class="gene">${g}</span>`).join("") || "None";
+        const genes = (d.gencon_genes && d.gencon_genes.length) ? d.gencon_genes.map(g => `<span class="gene">${g}</span>`).join("") : "None detected";
         document.getElementById("analysisResult").innerHTML = `
             <div class="prediction ${cls}">
                 <h2>${d.prediction === "R" ? "🔴 RESISTANT (R)" : "🟢 SUSCEPTIBLE (S)"}</h2>
@@ -336,7 +360,7 @@ async function analyzeGenome() {
             </div>
         `;
     } catch(e) {
-        document.getElementById("analysisResult").innerHTML = `<div style="color:red;">Failed: ${e}</div>`;
+        document.getElementById("analysisResult").innerHTML = `<div style="color:red; margin-top:10px;"><b>Failed:</b> ${e.message}</div>`;
     } finally {
         document.getElementById("loader").style.display = "none";
     }
@@ -351,11 +375,7 @@ loadSummary();
 def index(): return HTML_PAGE
 
 @app.get("/api/summary")
-def api_summary():
-    out = dict(metrics)
-    for k in ["accuracy", "sensitivity", "specificity", "precision"]:
-        out[k] = round(out[k] * 100, 2)
-    return out
+def api_summary(): return metrics
 
 @app.get("/api/dataset")
 def api_dataset(search: str = ""):
@@ -374,6 +394,9 @@ async def api_analyze_fasta(file: UploadFile = File(...), ast: str = Form("")):
         content = await file.read()
         with open(fpath, "wb") as f:
             f.write(content)
-        return run_fasta_analysis(fpath, ast)
+        result = run_fasta_analysis(fpath, ast)
+        return JSONResponse(content=result)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
     finally:
         shutil.rmtree(tdir, ignore_errors=True)
