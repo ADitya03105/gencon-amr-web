@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/bin:${PATH}"
@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     hmmer \
     curl \
     ca-certificates \
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /usr/local/amrfinder && cd /usr/local/amrfinder && \
@@ -26,11 +27,10 @@ RUN amrfinder -u
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 COPY . .
 
-# Render defaults to port 10000 (or uses $PORT environment variable)
 ENV PORT=10000
 EXPOSE 10000
 
